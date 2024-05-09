@@ -1,0 +1,268 @@
+Milestone 3 - EDA and Data Cleaning 
+
+from pyspark.sql import SparkSession
+from pyspark.sql.functions import col, count, mean, min, max, stddev, when
+import matplotlib.pyplot as plt
+
+# Initialize Spark session
+spark = SparkSession.builder.appName("NYC Yellow Taxi Data EDA").getOrCreate()
+
+# Define the directory path containing all the Parquet files
+directory_path = "gs://my-project-bucket-eg/landing/"
+
+# Load all Parquet files from the directory into one DataFrame
+df = spark.read.parquet(directory_path)
+
+# Basic DataFrame information
+df.printSchema()
+num_observations = df.count()
+print(f"Number of observations: {num_observations}")
+
+# List of variables
+variables = df.columns
+print(f"List of variables: {variables}")
+
+# Count missing values per column
+missing_values = df.select([count(when(col(c).isNull(), c)).alias(c) for c in df.columns])
+missing_values.show()
+
+# Descriptive statistics for numeric variables
+numeric_features = [t[0] for t in df.dtypes if t[1] in ['int', 'float']]
+df.describe(numeric_features).show()
+
+# Date range for date variables
+df.select(min("pickup_datetime"), max("pickup_datetime")).show()
+
+# Visualize the distribution of a categorical variable
+df.groupBy("payment_type").count().toPandas().plot(kind='bar', x='payment_type', y='count')
+plt.show()
+
+# Remove unnecessary columns
+df_cleaned = df.drop("tolls_amount", "improvement_surcharge")
+
+# Fill in missing values or remove rows with missing values
+df_cleaned = df_cleaned.na.fill({"tip_amount": 0}).na.drop(subset=["trip_distance", "fare_amount"])
+
+# Rename columns and remove spaces
+for column in df_cleaned.columns:
+    df_cleaned = df_cleaned.withColumnRenamed(column, column.replace(" ", "_").lower())
+
+# Save the cleaned data to GCS in Parquet format
+df_cleaned.write.parquet("gs://my-project-bucket-eg/cleaned/clean_tripdata.parquet")
+
+# Stop Spark session
+spark.stop()
+
+
+This data consists of NYC Yellow Taxi Ride Data, and it was loaded from a GCS bucket. It has many files that consist of many variables: pickup and dropoff times, locations, distances, fares, and payment types. This offers a comprehensive way for understanding the patterns and behaviors. 
+Some of the challenges in feature engineering: 
+1- Data Complexity 
+2- Spatial Features 
+3- Missing Data 
+4- Scalability and Efficiency 
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+Milestone 4 - Feature Engineering 
+
+from pyspark.sql import SparkSession
+from pyspark.ml import Pipeline
+from pyspark.ml.feature import VectorAssembler, StringIndexer
+from pyspark.ml.regression import LinearRegression
+from pyspark.ml.evaluation import RegressionEvaluator
+from pyspark.ml.tuning import CrossValidator, ParamGridBuilder
+from pyspark.sql.functions import dayofweek, hour
+
+# Initialize Spark session on a Dataproc cluster
+spark = SparkSession.builder.appName("Tip Prediction Model").getOrCreate()
+
+# Read cleaned data from GCS
+df = spark.read.parquet("gs://my-project-bucket-eg/cleaned/clean_tripdata.parquet")
+
+# Feature Engineering: Extract time features and treat certain variables as categorical
+df = df.withColumn("pickup_hour", hour("tpep_pickup_datetime"))
+df = df.withColumn("day_of_week", dayofweek("tpep_pickup_datetime"))
+indexers = [
+    StringIndexer(inputCol=column, outputCol=column + "_indexed")
+    for column in ["pickup_hour", "day_of_week", "passenger_count"]
+]
+
+# Additional indexing for location IDs
+location_indexer = StringIndexer(inputCols=["PULocationID", "DOLocationID"], outputCols=["pu_location_index", "do_location_index"])
+
+# Assemble features
+feature_cols = ['pickup_hour_indexed', 'day_of_week_indexed', 'passenger_count_indexed', 'pu_location_index', 'do_location_index']
+vector_assembler = VectorAssembler(inputCols=feature_cols, outputCol="features")
+
+# Define the Linear Regression model
+lr = LinearRegression(featuresCol="features", labelCol="tip_amount")
+
+# Complete pipeline with all stages
+pipeline = Pipeline(stages=indexers + [location_indexer, vector_assembler, lr])
+
+# Create parameter grid for model tuning
+paramGrid = ParamGridBuilder() \
+    .addGrid(lr.regParam, [0.1, 0.01]) \
+    .addGrid(lr.fitIntercept, [False, True]) \
+    .build()
+
+# Setup evaluator for RMSE
+evaluator = RegressionEvaluator(metricName="rmse", labelCol="tip_amount", predictionCol="prediction")
+
+# Configure cross validator
+crossval = CrossValidator(estimator=pipeline,
+                          estimatorParamMaps=paramGrid,
+                          evaluator=evaluator,
+                          numFolds=3)  # Use 3+ folds in practice
+
+# Fit the model using cross-validation
+cvModel = crossval.fit(df)
+
+# Extract the best model and show its RMSE performance
+bestModel = cvModel.bestModel
+predictions = bestModel.transform(df)
+print("Best model RMSE:", evaluator.evaluate(predictions))
+
+# Evaluate and print the R-squared value
+evaluator.setMetricName("r2")
+print("Best model R-squared:", evaluator.evaluate(predictions))
+
+# Save your model
+bestModel.write().overwrite().save("gs://my-project-bucket-eg/models/best_linear_regression_model")
+
+# Stop Spark session
+spark.stop()
+
+
+
+Table: 
+
+Column Name
+Data Type
+Feature Engineering 
+tpep_pickup_datetime
+Timestamp
+Extracted 'pickup_hour' and 'day_of_week'
+PULocationID
+Numeric
+StringIndexer to 'pu_location_index'
+DOLocationID
+Numeric
+StringIndexer to 'do_location_index'
+Passenger_count
+Numeric
+Used as-is 
+
+
+
+Some challenges that can arise in this project can include: the good quality of the feature extraction processes- especially when handling issues regarding time data. The output of this is the RMSE model which predicts accuracy. 
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+Milestone 5 - Data Visualization 
+
+import pandas as pd
+import matplotlib.pyplot as plt
+import seaborn as sns
+
+# Load the predictions DataFrame
+df = pd.read_parquet('path_to_predictions.parquet')
+Visualization 1: 
+Distribution of Tip Amounts - this visualization will show the distribution of tip amounts, helping to understand the range and outliers
+
+plt.figure(figsize=(10, 6))
+sns.histplot(df['tip_amount'], bins=30, kde=True)
+plt.title('Distribution of Tip Amounts')
+plt.xlabel('Tip Amount ($)')
+plt.ylabel('Frequency')
+plt.grid(True)
+plt.savefig('distribution_of_tips.png')
+plt.show()
+
+Visualization 2: 
+Tip Amount vs. Pickup Hour - this visualization will be a boxplot showing how tips change across different hours of the day (like higher tips during rush hour) 
+
+plt.figure(figsize=(10, 6))
+sns.boxplot(x='pickup_hour', y='tip_amount', data=df)
+plt.title('Tip Amount by Pickup Hour')
+plt.xlabel('Hour of Day')
+plt.ylabel('Tip Amount ($)')
+plt.grid(True)
+plt.savefig('tips_by_hour.png')
+plt.show()
+
+
+Visualization 3: 
+Tip Amounts by the day of the week - this will be a bar chart comparing average tips across days of the week to see if there are trends related to specific days 
+
+plt.figure(figsize=(10, 6))
+sns.barplot(x='day_of_week', y='tip_amount', data=df, estimator=np.mean)
+plt.title('Average Tip Amounts by Day of the Week')
+plt.xlabel('Day of the Week')
+plt.ylabel('Average Tip Amount ($)')
+plt.grid(True)
+plt.savefig('average_tips_by_day.png')
+plt.show()
+
+
+Visualization 4: 
+Actual VS. Predicted Tips - this will be a scatter plot to show the accuracy of the predictions against the actual tips 
+
+plt.figure(figsize=(10, 6))
+sns.scatterplot(x='tip_amount', y='predicted_tip', data=df)
+plt.plot([df['tip_amount'].min(), df['tip_amount'].max()],
+         [df['tip_amount'].min(), df['tip_amount'].max()], 'r--')  # Reference line for perfect predictions
+plt.title('Actual vs. Predicted Tip Amounts')
+plt.xlabel('Actual Tip Amount ($)')
+plt.ylabel('Predicted Tip Amount ($)')
+plt.grid(True)
+plt.savefig('actual_vs_predicted_tips.png')
+plt.show()
+
+
